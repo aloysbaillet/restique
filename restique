@@ -9,6 +9,9 @@ import logging
 import subprocess
 import json
 import shutil
+import pty
+import tty
+import select
 from pathlib import Path
 
 __PROG__ = 'restique'
@@ -138,61 +141,49 @@ def get_restic_path(config):
 def get_process(cmd, env = {}):
     env_with_path = env.copy()
     env_with_path.update(os.environ.copy())
+    master, slave = pty.openpty()
 
     process = subprocess.Popen(
         cmd,
-        #stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
+        stdin=slave, stdout=slave, stderr=slave,
         bufsize=1,
         universal_newlines=True,
         env=env_with_path,
+        close_fds=True
     )
+    
+    return process, master
 
-    return process
-
-def run_interactive_command(cmd, env = {}):
+def run_command(cmd, env = {}):
     logging.debug('Interactive command: ' + ' '.join(cmd))
-
     try:
-        process = get_process(cmd, env)
-        output = process.communicate()[0]
-
-        sys.stdout.write(output)
-        sys.stdout.flush()
-
-        rc = process.poll()
-        return rc;
+        p, master = get_process(cmd, env)
+        timeout = .04 # seconds
+        while p.poll() is None:
+            ready, _, _ = select.select([master, pty.STDIN_FILENO], [], [], timeout)
+            if master in ready:
+                data = os.read(master, 1024)
+                if not data:
+                    break
+                os.write(pty.STDOUT_FILENO, data)
+            if pty.STDIN_FILENO in ready:
+                data = os.read(pty.STDIN_FILENO, 1024)
+                while data != '':
+                    n = os.write(master, data)
+                    data = data[n:]
+        ret = p.wait()
 
     except KeyboardInterrupt:
         logging.info('Received keyboard interrupt')
-        return None;
-
-def run_noninteractive_command(cmd, env = {}):
-    logging.debug('Non-interactive command: ' + ' '.join(cmd))
-
-    try:
-        process = get_process(cmd, env)
-        while True:
-            output = process.stdout.readline()
-            if output == '' and process.poll() is not None:
-                break
-            if output:
-                sys.stdout.write(output)
-
-            sys.stdout.flush()
-
-        rc = process.poll()
-        return rc;
-
-    except KeyboardInterrupt:
-        logging.info('Received keyboard interrupt')
-        return(None)
+        return None
+    
+    return ret
 
 def run_hook(cmd, env):
     env_with_path = env.copy()
     env_with_path.update(os.environ.copy())
 
-    return subprocess.run(
+    return subprocess.call(
         cmd,
         env=env_with_path,
         shell=True,
@@ -305,7 +296,7 @@ def cmd_default(command, config, args):
 
     run_cmd_hooks(config, env, 'pre-repo')
     run_cmd_hooks(config, env, 'pre-' + command)
-    rc = run_noninteractive_command(cmd, env)
+    rc = run_command(cmd, env)
     run_cmd_hooks(config, env, 'post-' + command)
     run_cmd_hooks(config, env, 'post-repo')
     sys.exit(rc)
@@ -327,18 +318,18 @@ def cmd_backup(command, config, args):
         ])
 
         cmd += config['files']
-
-        for pattern in config['excludes']:
-            cmd += [
-                '--exclude',
-                pattern,
-            ]
+        if 'excludes' in config:
+            for pattern in config['excludes']:
+                cmd += [
+                    '--exclude',
+                    pattern,
+                ]
 
     cmd += args.resticargs
 
     run_cmd_hooks(config, env, 'pre-repo')
     run_cmd_hooks(config, env, 'pre-' + command)
-    rc = run_noninteractive_command(cmd, env)
+    rc = run_command(cmd, env)
     run_cmd_hooks(config, env, 'post-' + command)
     run_cmd_hooks(config, env, 'post-repo')
     sys.exit(rc)
@@ -358,10 +349,7 @@ def cmd_key(command, config, args):
     run_cmd_hooks(config, env, 'pre-repo')
     run_cmd_hooks(config, env, 'pre-' + command)
 
-    if args.resticargs and 'add' in args.resticargs:
-        rc = run_interactive_command(cmd, env)
-    else:
-        rc = run_noninteractive_command(cmd, env)
+    rc = run_command(cmd, env)
 
     run_cmd_hooks(config, env, 'post-' + command)
     run_cmd_hooks(config, env, 'post-repo')
@@ -377,7 +365,7 @@ def cmd_version(command, config, args):
     run_cmd_hooks(config, {}, 'pre-' + command)
     print(__PROG__ + ' ' + __VERSION__)
     print('python ' + platform.python_version())
-    rc = run_noninteractive_command(cmd, {})
+    rc = run_command(cmd, {})
     run_cmd_hooks(config, {}, 'post-' + command)
     run_cmd_hooks(config, {}, 'post-repo')
 
